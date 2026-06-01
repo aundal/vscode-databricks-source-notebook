@@ -1,0 +1,285 @@
+{
+  "name": "databricks-source-notebook-prototype",
+  "displayName": "Databricks Source Notebook Prototype",
+  "description": "Prototype notebook UX for Databricks source-format Python notebooks in VS Code.",
+  "version": "0.0.1",
+  "publisher": "standup-steve",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aundal/vscode-databricks-source-notebook.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "dependencies": {
+    "monaco-editor": "^0.55.1"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "databricks",
+    "notebook",
+    "jupyter",
+    "python",
+    "prototype"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onNotebook:databricks-source-notebook",
+    "onCustomEditor:databricksSourceNotebook.editor",
+    "onCommand:databricksSourceNotebook.newNotebook",
+    "onCommand:databricksSourceNotebook.saveToSourceFile",
+    "onCommand:databricksSourceNotebook.selectProfile",
+    "onCommand:databricksSourceNotebook.selectCluster",
+    "onCommand:databricksSourceNotebook.restartSession",
+    "onCommand:databricksSourceNotebook.refreshProfiles",
+    "onCommand:databricksSourceNotebook.connectProfile",
+    "onCommand:databricksSourceNotebook.loginProfile",
+    "onCommand:databricksSourceNotebook.openPowerShellTerminal",
+    "onCommand:databricksSourceNotebook.openHelp",
+    "onCommand:databricksSourceNotebook.openLog",
+    "onView:databricksSourceNotebook.profiles"
+  ],
+  "contributes": {
+    "notebooks": [
+      {
+        "type": "databricks-source-notebook",
+        "displayName": "Databricks Source Notebook",
+        "priority": "option",
+        "selector": [
+          {
+            "filenamePattern": "*.py"
+          }
+        ]
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "databricksSourceNotebook.editor",
+        "displayName": "Databricks Source Editor",
+        "selector": [
+          {
+            "filenamePattern": "*.py"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "databricksSourceNotebook.newNotebook",
+        "category": "Databricks Notebook",
+        "title": "New notebook"
+      },
+      {
+        "command": "databricksSourceNotebook.selectProfile",
+        "category": "Databricks Notebook",
+        "title": "Select profile"
+      },
+      {
+        "command": "databricksSourceNotebook.selectCluster",
+        "category": "Databricks Notebook",
+        "title": "Select cluster"
+      },
+      {
+        "command": "databricksSourceNotebook.clusterActionSelect",
+        "category": "Databricks Notebook",
+        "title": "Select cluster",
+        "icon": "$(server-environment)"
+      },
+      {
+        "command": "databricksSourceNotebook.clusterActionStart",
+        "category": "Databricks Notebook",
+        "title": "Start cluster",
+        "icon": "$(play)"
+      },
+      {
+        "command": "databricksSourceNotebook.clusterActionStarting",
+        "category": "Databricks Notebook",
+        "title": "Starting cluster",
+        "icon": "$(loading~spin)"
+      },
+      {
+        "command": "databricksSourceNotebook.clusterActionStop",
+        "category": "Databricks Notebook",
+        "title": "Stop cluster",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "databricksSourceNotebook.clusterActionTimedOut",
+        "category": "Databricks Notebook",
+        "title": "Cluster timed out",
+        "icon": "$(warning)"
+      },
+      {
+        "command": "databricksSourceNotebook.restartSession",
+        "category": "Databricks Notebook",
+        "title": "Restart session"
+      },
+      {
+        "command": "databricksSourceNotebook.refreshProfiles",
+        "category": "Databricks",
+        "title": "Refresh profiles",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "databricksSourceNotebook.connectProfile",
+        "category": "Databricks",
+        "title": "Select Enviroment",
+        "icon": "$(play)"
+      },
+      {
+        "command": "databricksSourceNotebook.loginProfile",
+        "category": "Databricks",
+        "title": "Login",
+        "icon": "$(key)"
+      },
+      {
+        "command": "databricksSourceNotebook.openPowerShellTerminal",
+        "category": "Databricks Notebook",
+        "title": "Open PowerShell terminal",
+        "icon": "$(terminal-powershell)"
+      },
+      {
+        "command": "databricksSourceNotebook.openHelp",
+        "category": "Databricks Notebook",
+        "title": "Help",
+        "icon": "$(question)"
+      },
+      {
+        "command": "databricksSourceNotebook.openLog",
+        "category": "Databricks Notebook",
+        "title": "Show log",
+        "icon": "$(output)"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "databricksSourceNotebook.profiles",
+          "name": "Databricks Profiles"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "databricksSourceNotebook.profiles",
+        "contents": "No Databricks profiles found.\n[Refresh](command:databricksSourceNotebook.refreshProfiles)"
+      }
+    ],
+    "menus": {
+      "file/newFile": [
+        {
+          "command": "databricksSourceNotebook.newNotebook"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "databricksSourceNotebook.connectProfile",
+          "when": "view == databricksSourceNotebook.profiles && viewItem == databricksProfile",
+          "group": "inline"
+        },
+        {
+          "command": "databricksSourceNotebook.loginProfile",
+          "when": "view == databricksSourceNotebook.profiles && viewItem == databricksProfileNeedsLogin",
+          "group": "inline@1"
+        }
+      ],
+      "notebook/toolbar": [
+        {
+          "command": "databricksSourceNotebook.connectProfile",
+          "when": "notebookType == databricks-source-notebook",
+          "group": "navigation"
+        },
+        {
+          "command": "databricksSourceNotebook.loginProfile",
+          "when": "notebookType == databricks-source-notebook && databricksSourceNotebook.hasSelectedProfile && databricksSourceNotebook.selectedProfileNeedsLogin",
+          "group": "navigation@1"
+        },
+        {
+          "command": "databricksSourceNotebook.clusterActionSelect",
+          "when": "notebookType == databricks-source-notebook && !databricksSourceNotebook.hasSelectedCluster",
+          "group": "navigation@2"
+        },
+        {
+          "command": "databricksSourceNotebook.clusterActionSelect",
+          "when": "notebookType == databricks-source-notebook && databricksSourceNotebook.hasSelectedCluster && databricksSourceNotebook.clusterState == 'stopped'",
+          "group": "navigation@3"
+        },
+        {
+          "command": "databricksSourceNotebook.clusterActionSelect",
+          "when": "notebookType == databricks-source-notebook && databricksSourceNotebook.hasSelectedCluster && databricksSourceNotebook.clusterState == 'selected'",
+          "group": "navigation@4"
+        },
+        {
+          "command": "databricksSourceNotebook.clusterActionStarting",
+          "when": "notebookType == databricks-source-notebook && databricksSourceNotebook.hasSelectedCluster && databricksSourceNotebook.clusterState == 'starting'",
+          "group": "navigation@5"
+        },
+        {
+          "command": "databricksSourceNotebook.clusterActionStop",
+          "when": "notebookType == databricks-source-notebook && databricksSourceNotebook.hasSelectedCluster && databricksSourceNotebook.clusterState == 'running'",
+          "group": "navigation@6"
+        },
+        {
+          "command": "databricksSourceNotebook.clusterActionTimedOut",
+          "when": "notebookType == databricks-source-notebook && databricksSourceNotebook.hasSelectedCluster && databricksSourceNotebook.clusterState == 'timedOut'",
+          "group": "navigation@7"
+        },
+        {
+          "command": "databricksSourceNotebook.restartSession",
+          "when": "notebookType == databricks-source-notebook",
+          "group": "navigation@8"
+        },
+        {
+          "command": "databricksSourceNotebook.openPowerShellTerminal",
+          "when": "notebookType == databricks-source-notebook",
+          "group": "navigation@9"
+        },
+        {
+          "command": "databricksSourceNotebook.openHelp",
+          "when": "notebookType == databricks-source-notebook",
+          "group": "navigation@10"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Databricks Source Notebook",
+      "type": "object",
+      "properties": {
+        "databricksSourceNotebook.cliPath": {
+          "type": "string",
+          "default": "databricks",
+          "description": "Path to the Databricks CLI executable."
+        },
+        "databricksSourceNotebook.profile": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Databricks CLI profile to use for notebook execution. If empty, the extension prompts you to choose one."
+        },
+        "databricksSourceNotebook.clusterId": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Databricks cluster ID to use for notebook execution. If empty, the extension prompts you to choose one."
+        },
+        "databricksSourceNotebook.pollIntervalMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 250,
+          "description": "Polling interval in milliseconds for Databricks command execution status."
+        },
+        "databricksSourceNotebook.commandTimeoutSeconds": {
+          "type": "number",
+          "default": 1200,
+          "minimum": 30,
+          "description": "Maximum time to wait for a Databricks execution context or command to complete."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "monaco-editor": "^0.55.1"
+  }
+}
