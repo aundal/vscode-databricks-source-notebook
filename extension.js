@@ -41,11 +41,61 @@ const IDLE_CLUSTER_POLL_MS = 60000;
 const CLUSTER_LABEL_REFRESH_MS = 1000;
 const RUNNING_CLUSTER_MARKER = '🟢';
 const SOURCE_EDITOR_SUPPORTED_CELL_TYPES = ['python', 'sql', 'scala', 'r', 'md', 'sh', 'fs', 'run', 'pip', 'uv'];
-const CLUSTER_TIMER_RESET_COMMAND = 'print("");';
+const CLUSTER_TIMER_RESET_COMMAND = 'print(1);';
+const INLINE_TABLE_MARKER = '__DATABRICKS_SOURCE_TABLE__:';
+const PYTHON_DISPLAY_SHIM = [
+  'import json as __vscode_dsn_json',
+  '',
+  'def __vscode_dsn_display_value(value):',
+  '    if value is None:',
+  '        return ""',
+  '    try:',
+  '        return value.isoformat()',
+  '    except Exception:',
+  '        pass',
+  '    return str(value)',
+  '',
+  'def __vscode_dsn_emit_table(columns, rows, truncated=False):',
+  `    print(${JSON.stringify(INLINE_TABLE_MARKER)} + __vscode_dsn_json.dumps({"columns": [str(column) for column in columns], "rows": rows, "truncated": bool(truncated)}, separators=(",", ":")))`,
+  '',
+  'def display(value, limit=200):',
+  '    try:',
+  '        if hasattr(value, "limit") and hasattr(value, "collect") and hasattr(value, "columns"):',
+  '            preview = value.limit(limit + 1).collect()',
+  '            truncated = len(preview) > limit',
+  '            rows = preview[:limit]',
+  '            __vscode_dsn_emit_table(value.columns, [[__vscode_dsn_display_value(row[column]) for column in value.columns] for row in rows], truncated)',
+  '            return value',
+  '    except Exception:',
+  '        pass',
+  '',
+  '    try:',
+  '        if hasattr(value, "head") and hasattr(value, "columns") and hasattr(value, "to_dict"):',
+  '            preview = value.head(limit + 1)',
+  '            data_rows = preview.to_dict(orient="records")',
+  '            truncated = len(data_rows) > limit',
+  '            rows = data_rows[:limit]',
+  '            __vscode_dsn_emit_table(list(value.columns), [[__vscode_dsn_display_value(row.get(column)) for column in value.columns] for row in rows], truncated)',
+  '            return value',
+  '    except Exception:',
+  '        pass',
+  '',
+  '    if hasattr(value, "show"):',
+  '        try:',
+  '            value.show(limit, truncate=False)',
+  '            return value',
+  '        except Exception:',
+  '            pass',
+  '',
+  '    print(__vscode_dsn_display_value(value))',
+  '    return value',
+  '',
+].join('\n');
 
 const clusterActivityTimestamps = new Map();
 const clusterStatusSnapshots = new Map();
 const clusterTimerResetPromises = new Map();
+const clusterTimerResetPendingKeys = new Set();
 const lastDatabricksUiState = {
   selectedProfileNeedsLogin: false,
 };
@@ -479,6 +529,7 @@ class DatabricksSourceEditorProvider {
       enableScripts: true,
       localResourceRoots: [
         vscode.Uri.joinPath(this._context.extensionUri, 'node_modules', 'monaco-editor', 'min'),
+        vscode.Uri.joinPath(this._context.extensionUri, 'node_modules', 'markdown-it', 'dist'),
       ],
     };
     webviewPanel.webview.html = this._getHtml(webviewPanel.webview);
@@ -630,6 +681,30 @@ class DatabricksSourceEditorProvider {
       return;
     }
 
+    if (message.type === 'copyText') {
+      await vscode.env.clipboard.writeText(String(message.value || ''));
+      return;
+    }
+
+    if (message.type === 'exportCsv') {
+      const uri = await vscode.window.showSaveDialog({
+        saveLabel: 'Export table as CSV',
+        filters: {
+          CSV: ['csv'],
+        },
+      });
+      if (!uri) {
+        return;
+      }
+
+      const csv = buildCsvFromTable(
+        Array.isArray(message.columns) ? message.columns : [],
+        Array.isArray(message.rows) ? message.rows : []
+      );
+      await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(csv));
+      return;
+    }
+
     if (message.type === 'clusterAction') {
       const state = String(message.state || '');
       if (state === 'runningUnknownTimer') {
@@ -645,6 +720,9 @@ class DatabricksSourceEditorProvider {
         selected: COMMANDS.clusterActionSelect,
         none: COMMANDS.clusterActionSelect,
       }[state] || COMMANDS.clusterActionSelect;
+      if (command === COMMANDS.clusterActionStop) {
+        await this._postRunningState(document, { cellIndex: null, runAll: false });
+      }
       await vscode.commands.executeCommand(command);
       await refreshDatabricksUi();
       return;
@@ -779,6 +857,9 @@ class DatabricksSourceEditorProvider {
     const nonce = createNonce();
     const monacoBaseUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this._context.extensionUri, 'node_modules', 'monaco-editor', 'min')
+    );
+    const markdownItScriptUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this._context.extensionUri, 'node_modules', 'markdown-it', 'dist', 'markdown-it.min.js')
     );
     const csp = [
       "default-src 'none'",
@@ -1204,6 +1285,157 @@ class DatabricksSourceEditorProvider {
       gap: 8px;
     }
 
+    .output-pending {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .output-spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid color-mix(in srgb, var(--fg) 20%, transparent);
+      border-top-color: var(--fg);
+      border-radius: 50%;
+      animation: output-spin 0.8s linear infinite;
+    }
+
+    @keyframes output-spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    .output-table {
+      display: grid;
+      gap: 8px;
+    }
+
+    .output-table-toolbar {
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .output-table-scroll {
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+
+    .output-table-grid {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    .output-table-grid th,
+    .output-table-grid td {
+      border: 1px solid var(--border);
+      padding: 6px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .output-table-grid tbody tr:hover {
+      background: color-mix(in srgb, var(--bg) 88%, black);
+    }
+
+    .output-table-grid th {
+      position: sticky;
+      top: 0;
+      background: var(--vscode-editorWidget-background, var(--bg));
+      z-index: 1;
+    }
+
+    .output-table-heading {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .output-table-sort,
+    .output-table-menu-toggle {
+      min-height: 22px;
+      padding: 0 6px;
+      font-size: 12px;
+    }
+
+    .output-table-sort {
+      flex: 1 1 auto;
+      justify-content: flex-start;
+      text-align: left;
+    }
+
+    .output-table-menu {
+      position: absolute;
+      top: calc(100% + 4px);
+      right: 0;
+      z-index: 5;
+      min-width: 220px;
+      padding: 6px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--vscode-dropdown-background, var(--vscode-editorWidget-background, var(--bg)));
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+      display: grid;
+      gap: 8px;
+    }
+
+    .output-table-menu button {
+      width: 100%;
+      justify-content: flex-start;
+      text-align: left;
+    }
+
+    .output-table-menu-section {
+      display: grid;
+      gap: 6px;
+    }
+
+    .output-table-menu-label {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .output-table-menu-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .output-table-menu-row input[type="text"] {
+      width: 100%;
+      min-height: 28px;
+      border: 1px solid var(--input-border);
+      border-radius: 6px;
+      background: var(--input-bg);
+      color: var(--input-fg);
+      padding: 0 8px;
+      font: inherit;
+    }
+
+    .output-table-menu-row input[type="color"] {
+      width: 40px;
+      min-width: 40px;
+      height: 28px;
+      padding: 2px;
+      border: 1px solid var(--input-border);
+      border-radius: 6px;
+      background: var(--input-bg);
+    }
+
+    .output-table-menu-row button {
+      width: auto;
+      white-space: nowrap;
+    }
+
+    .output-table-note {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
     .output pre {
       margin: 0;
       white-space: pre-wrap;
@@ -1220,6 +1452,39 @@ class DatabricksSourceEditorProvider {
 
     .warning {
       color: var(--warning);
+    }
+
+    .markdown-preview {
+      padding: 12px;
+      border-top: 1px solid var(--border);
+      background: color-mix(in srgb, var(--bg) 98%, var(--input-bg));
+    }
+
+    .markdown-preview :first-child {
+      margin-top: 0;
+    }
+
+    .markdown-preview :last-child {
+      margin-bottom: 0;
+    }
+
+    .markdown-preview pre {
+      padding: 12px;
+      border-radius: 6px;
+      overflow: auto;
+      background: color-mix(in srgb, var(--bg) 94%, black);
+    }
+
+    .markdown-preview code {
+      font-family: var(--vscode-editor-font-family, Consolas, monospace);
+      font-size: 12px;
+    }
+
+    .markdown-preview blockquote {
+      margin: 0;
+      padding-left: 12px;
+      border-left: 3px solid var(--border);
+      color: var(--muted);
     }
 
     .empty {
@@ -1266,6 +1531,7 @@ class DatabricksSourceEditorProvider {
       <div class="empty">Loading Databricks source editor...</div>
     </div>
   </div>
+  <script nonce="${nonce}" src="${markdownItScriptUri}"></script>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const supportedCellTypes = ${JSON.stringify(SOURCE_EDITOR_SUPPORTED_CELL_TYPES)};
@@ -1311,7 +1577,11 @@ class DatabricksSourceEditorProvider {
     let isApplyingLocalEdit = false;
     let monacoReady = false;
     let monacoReadyPromise;
+    let markdownRenderer;
     const collapsedCellIndexes = new Set();
+    const markdownPreviewIndexes = new Set();
+    const tableViewState = new Map();
+    let openTableMenu = null;
     const highlightedLanguageSupport = new Set(['python', 'sql', 'scala', 'r', 'md', 'sh']);
     const highlightedKeywords = {
       python: new Set(['and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'False', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'None', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield']),
@@ -1327,6 +1597,7 @@ class DatabricksSourceEditorProvider {
       }
       if (message.type === 'runResult') {
         runResults.set(message.index, message.result || { outputs: [] });
+        resetTableState(message.index);
         queueRender();
         return;
       }
@@ -1336,7 +1607,7 @@ class DatabricksSourceEditorProvider {
           cellIndex: Number.isInteger(message.cellIndex) ? message.cellIndex : null,
           runAll: message.runAll === true,
         };
-        renderHeader();
+        queueRender();
         return;
       }
 
@@ -1433,6 +1704,103 @@ class DatabricksSourceEditorProvider {
         return;
       }
 
+      const markdownPreviewToggle = event.target.closest('[data-markdown-preview-toggle]');
+      if (markdownPreviewToggle) {
+        const index = Number(markdownPreviewToggle.dataset.markdownPreviewToggle);
+        if (Number.isInteger(index)) {
+          if (markdownPreviewIndexes.has(index)) {
+            markdownPreviewIndexes.delete(index);
+          } else {
+            markdownPreviewIndexes.add(index);
+          }
+          queueRender();
+        }
+        return;
+      }
+
+      const tableSortTarget = event.target.closest('[data-table-sort]');
+      if (tableSortTarget) {
+        const cellIndex = Number(tableSortTarget.dataset.cellIndex);
+        const outputIndex = Number(tableSortTarget.dataset.outputIndex);
+        const columnIndex = Number(tableSortTarget.dataset.columnIndex);
+        if (Number.isInteger(cellIndex) && Number.isInteger(outputIndex) && Number.isInteger(columnIndex)) {
+          const state = ensureTableViewState(cellIndex, outputIndex);
+          if (state.sortColumn === columnIndex) {
+            state.sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
+          } else {
+            state.sortColumn = columnIndex;
+            state.sortDirection = 'asc';
+          }
+          openTableMenu = null;
+          queueRender();
+        }
+        return;
+      }
+
+      const tableMenuToggle = event.target.closest('[data-table-menu-toggle]');
+      if (tableMenuToggle) {
+        const cellIndex = Number(tableMenuToggle.dataset.cellIndex);
+        const outputIndex = Number(tableMenuToggle.dataset.outputIndex);
+        const columnIndex = Number(tableMenuToggle.dataset.columnIndex);
+        if (Number.isInteger(cellIndex) && Number.isInteger(outputIndex) && Number.isInteger(columnIndex)) {
+          if (openTableMenu && openTableMenu.cellIndex === cellIndex && openTableMenu.outputIndex === outputIndex && openTableMenu.columnIndex === columnIndex) {
+            openTableMenu = null;
+          } else {
+            openTableMenu = { cellIndex, outputIndex, columnIndex };
+          }
+          queueRender();
+        }
+        return;
+      }
+
+      const tableMenuAction = event.target.closest('[data-table-menu-action]');
+      if (tableMenuAction) {
+        const actionName = tableMenuAction.dataset.tableMenuAction;
+        const cellIndex = Number(tableMenuAction.dataset.cellIndex);
+        const outputIndex = Number(tableMenuAction.dataset.outputIndex);
+        const columnIndex = Number(tableMenuAction.dataset.columnIndex);
+        handleTableMenuAction(actionName, cellIndex, outputIndex, columnIndex);
+        return;
+      }
+
+      const tableFilterApply = event.target.closest('[data-table-filter-apply]');
+      if (tableFilterApply) {
+        applyTableFilter(
+          Number(tableFilterApply.dataset.cellIndex),
+          Number(tableFilterApply.dataset.outputIndex),
+          Number(tableFilterApply.dataset.columnIndex)
+        );
+        return;
+      }
+
+      const tableFilterClear = event.target.closest('[data-table-filter-clear]');
+      if (tableFilterClear) {
+        clearTableFilter(
+          Number(tableFilterClear.dataset.cellIndex),
+          Number(tableFilterClear.dataset.outputIndex),
+          Number(tableFilterClear.dataset.columnIndex)
+        );
+        return;
+      }
+
+      const tableColorClear = event.target.closest('[data-table-color-clear]');
+      if (tableColorClear) {
+        clearTableColor(
+          Number(tableColorClear.dataset.cellIndex),
+          Number(tableColorClear.dataset.outputIndex),
+          Number(tableColorClear.dataset.columnIndex)
+        );
+        return;
+      }
+
+      const tableExportTarget = event.target.closest('[data-table-export]');
+      if (tableExportTarget) {
+        const cellIndex = Number(tableExportTarget.dataset.cellIndex);
+        const outputIndex = Number(tableExportTarget.dataset.outputIndex);
+        exportTableAsCsv(cellIndex, outputIndex);
+        return;
+      }
+
       const runCellTarget = event.target.closest('[data-run-cell]');
       if (runCellTarget) {
         if (runCellTarget.disabled) {
@@ -1478,6 +1846,17 @@ class DatabricksSourceEditorProvider {
         return;
       }
 
+      const tableFilterInput = event.target.closest('input[data-table-filter-input]');
+      if (tableFilterInput && event.key === 'Enter') {
+        event.preventDefault();
+        applyTableFilter(
+          Number(tableFilterInput.dataset.cellIndex),
+          Number(tableFilterInput.dataset.outputIndex),
+          Number(tableFilterInput.dataset.columnIndex)
+        );
+        return;
+      }
+
       const textarea = event.target.closest('textarea[data-cell-text]');
       if (!textarea) {
         return;
@@ -1503,6 +1882,13 @@ class DatabricksSourceEditorProvider {
       if (!event.target.closest('[data-cell-kind-badge]') && !event.target.closest('[data-cell-kind-menu]')) {
         if (openLanguagePickerIndex !== null) {
           openLanguagePickerIndex = null;
+          queueRender();
+        }
+      }
+
+      if (!event.target.closest('[data-table-menu]') && !event.target.closest('[data-table-menu-toggle]')) {
+        if (openTableMenu !== null) {
+          openTableMenu = null;
           queueRender();
         }
       }
@@ -1536,6 +1922,19 @@ class DatabricksSourceEditorProvider {
     });
 
     document.addEventListener('input', (event) => {
+      const tableColorInput = event.target.closest('input[data-table-color-input]');
+      if (tableColorInput) {
+        const cellIndex = Number(tableColorInput.dataset.cellIndex);
+        const outputIndex = Number(tableColorInput.dataset.outputIndex);
+        const columnIndex = Number(tableColorInput.dataset.columnIndex);
+        if (Number.isInteger(cellIndex) && Number.isInteger(outputIndex) && Number.isInteger(columnIndex)) {
+          const tableState = ensureTableViewState(cellIndex, outputIndex);
+          tableState.columnColors[columnIndex] = String(tableColorInput.value || '');
+          queueRender();
+        }
+        return;
+      }
+
       const titleInput = event.target.closest('input[data-cell-title]');
       if (titleInput) {
         const index = Number(titleInput.dataset.cellTitle);
@@ -1679,6 +2078,8 @@ class DatabricksSourceEditorProvider {
         const lineNumbers = renderLineNumbers(cell.value || '');
         const isPickerOpen = openLanguagePickerIndex === index;
         const isCollapsed = collapsedCellIndexes.has(index);
+        const isMarkdown = type === 'md';
+        const isMarkdownPreview = isMarkdown && markdownPreviewIndexes.has(index);
         const cellBodyId = 'cell-body-' + index;
         return '' +
           '<section class="cell' + (isCollapsed ? ' collapsed' : '') + '" data-cell-index="' + index + '">' +
@@ -1697,6 +2098,7 @@ class DatabricksSourceEditorProvider {
                 : '') +
               '<input type="text" class="cell-title-input" data-cell-title="' + index + '" value="' + escapeHtmlAttribute(title) + '" placeholder="Title" aria-label="Cell title" />' +
               '<div class="cell-actions">' +
+                (isMarkdown ? '<button type="button" data-markdown-preview-toggle="' + index + '" class="secondary" title="Toggle markdown preview">' + (isMarkdownPreview ? 'Edit' : 'Preview') + '</button>' : '') +
                 '<button type="button" data-run-cell="' + index + '" class="icon-button" title="' + (isRunning ? 'Running cell' : 'Run cell') + '">' + runButtonLabel + '</button>' +
                 '<button type="button" data-cell-action="addAbove" data-index="' + index + '" class="icon-button" title="Add cell above">＋↑</button>' +
                 '<button type="button" data-cell-action="addBelow" data-index="' + index + '" class="icon-button" title="Add cell below">＋↓</button>' +
@@ -1704,13 +2106,15 @@ class DatabricksSourceEditorProvider {
               '</div>' +
             '</div>' +
             '<div class="cell-body" id="' + cellBodyId + '"' + (isCollapsed ? ' hidden' : '') + '>' +
-              '<div class="editor-wrap">' +
-                '<pre class="line-numbers" data-line-numbers="' + index + '" aria-hidden="true">' + lineNumbers + '</pre>' +
-                '<div class="editor-main">' +
-                  '<pre class="' + codeClass + '" aria-hidden="true">' + renderCodePreview(cell.value || '', type) + '</pre>' +
-                  '<textarea data-cell-text="' + index + '" spellcheck="false">' + escapeHtml(cell.value || '') + '</textarea>' +
-                '</div>' +
-              '</div>' +
+              (isMarkdownPreview
+                ? '<div class="markdown-preview">' + renderMarkdownPreview(cell.value || '') + '</div>'
+                : '<div class="editor-wrap">' +
+                    '<pre class="line-numbers" data-line-numbers="' + index + '" aria-hidden="true">' + lineNumbers + '</pre>' +
+                    '<div class="editor-main">' +
+                      '<pre class="' + codeClass + '" aria-hidden="true">' + renderCodePreview(cell.value || '', type) + '</pre>' +
+                      '<textarea data-cell-text="' + index + '" spellcheck="false">' + escapeHtml(cell.value || '') + '</textarea>' +
+                    '</div>' +
+                  '</div>') +
               renderOutput(index) +
             '</div>' +
           '</section>';
@@ -1727,22 +2131,242 @@ class DatabricksSourceEditorProvider {
           collapsedCellIndexes.delete(index);
         }
       }
+      for (const index of Array.from(markdownPreviewIndexes)) {
+        if (index < 0 || index >= cells.length || cells[index]?.type !== 'md') {
+          markdownPreviewIndexes.delete(index);
+        }
+      }
     }
 
     function renderOutput(index) {
       const result = runResults.get(index);
+      if (runningState.runAll || runningState.cellIndex === index) {
+        return '<div class="output"><div class="output-pending"><span class="output-spinner" aria-hidden="true"></span><span>Running...</span></div></div>';
+      }
       if (!result || !Array.isArray(result.outputs) || !result.outputs.length) {
         return '';
       }
 
-      return '<div class="output">' + result.outputs.map((output) => {
+      return '<div class="output">' + result.outputs.map((output, outputIndex) => {
         const mime = output.mime || 'text/plain';
         const value = String(output.value || '');
+        if (mime === 'application/x-databricks-table+json') {
+          return renderInteractiveTable(index, outputIndex, value);
+        }
         if (mime === 'text/html') {
           return '<iframe sandbox="allow-same-origin" srcdoc="' + escapeHtmlAttribute(value) + '"></iframe>';
         }
         return '<pre>' + escapeHtml(value) + '</pre>';
       }).join('') + '</div>';
+    }
+
+    function renderInteractiveTable(cellIndex, outputIndex, rawValue) {
+      const payload = parseInteractiveTablePayload(rawValue);
+      if (!payload) {
+        return '<pre>Invalid table output.</pre>';
+      }
+
+      const state = ensureTableViewState(cellIndex, outputIndex);
+      const tableData = getRenderedTableData(cellIndex, outputIndex, payload);
+      const header = payload.columns.map((column, columnIndex) => {
+        const sortIndicator = state.sortColumn === columnIndex ? (state.sortDirection === 'asc' ? ' ↑' : ' ↓') : '';
+        const filterIndicator = state.filters[columnIndex] ? ' *' : '';
+        const headingStyle = state.columnColors[columnIndex] ? ' style="color:' + escapeHtmlAttribute(state.columnColors[columnIndex]) + ';"' : '';
+        const menuOpen = openTableMenu && openTableMenu.cellIndex === cellIndex && openTableMenu.outputIndex === outputIndex && openTableMenu.columnIndex === columnIndex;
+        return '<th' + headingStyle + '>' +
+          '<div class="output-table-heading">' +
+            '<button type="button" class="output-table-sort" data-table-sort="true" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '" data-column-index="' + columnIndex + '">' + escapeHtml(column) + sortIndicator + filterIndicator + '</button>' +
+            '<button type="button" class="output-table-menu-toggle" data-table-menu-toggle="true" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '" data-column-index="' + columnIndex + '">▾</button>' +
+            (menuOpen ? renderTableMenu(cellIndex, outputIndex, columnIndex) : '') +
+          '</div>' +
+        '</th>';
+      }).join('');
+
+      const body = tableData.rows.map((row) => '<tr>' + row.map((value, columnIndex) => {
+        const cellStyle = state.columnColors[columnIndex] ? ' style="color:' + escapeHtmlAttribute(state.columnColors[columnIndex]) + ';"' : '';
+        return '<td' + cellStyle + '>' + escapeHtml(value === null || value === undefined ? '' : String(value)) + '</td>';
+      }).join('') + '</tr>').join('');
+
+      return '<div class="output-table">' +
+        '<div class="output-table-toolbar"><button type="button" data-table-export="true" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '">Export CSV</button></div>' +
+        '<div class="output-table-scroll"><table class="output-table-grid"><thead><tr>' + header + '</tr></thead><tbody>' + body + '</tbody></table></div>' +
+        (payload.truncated ? '<div class="output-table-note">Output truncated by Databricks.</div>' : '') +
+      '</div>';
+    }
+
+    function renderTableMenu(cellIndex, outputIndex, columnIndex) {
+      const tableState = ensureTableViewState(cellIndex, outputIndex);
+      const filterValue = tableState.filters[columnIndex] || '';
+      const colorValue = normalizeColorPickerValue(tableState.columnColors[columnIndex]);
+      return '<div class="output-table-menu" data-table-menu="true">' +
+        '<div class="output-table-menu-section">' +
+          '<div class="output-table-menu-label">Filter column</div>' +
+          '<div class="output-table-menu-row">' +
+            '<input type="text" data-table-filter-input="true" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '" data-column-index="' + columnIndex + '" value="' + escapeHtmlAttribute(filterValue) + '" placeholder="Contains text" />' +
+            '<button type="button" data-table-filter-apply="true" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '" data-column-index="' + columnIndex + '">Apply</button>' +
+            '<button type="button" data-table-filter-clear="true" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '" data-column-index="' + columnIndex + '">Clear</button>' +
+          '</div>' +
+        '</div>' +
+        '<button type="button" data-table-menu-action="copy" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '" data-column-index="' + columnIndex + '">Copy column name</button>' +
+        '<div class="output-table-menu-section">' +
+          '<div class="output-table-menu-label">Change column color</div>' +
+          '<div class="output-table-menu-row">' +
+            '<input type="color" data-table-color-input="true" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '" data-column-index="' + columnIndex + '" value="' + escapeHtmlAttribute(colorValue) + '" />' +
+            '<button type="button" data-table-color-clear="true" data-cell-index="' + cellIndex + '" data-output-index="' + outputIndex + '" data-column-index="' + columnIndex + '">Clear</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function handleTableMenuAction(actionName, cellIndex, outputIndex, columnIndex) {
+      if (!Number.isInteger(cellIndex) || !Number.isInteger(outputIndex) || !Number.isInteger(columnIndex)) {
+        return;
+      }
+
+      const payload = getInteractiveTablePayload(cellIndex, outputIndex);
+      if (!payload) {
+        return;
+      }
+
+      if (actionName === 'copy') {
+        vscode.postMessage({ type: 'copyText', value: payload.columns[columnIndex] || '' });
+        openTableMenu = null;
+        queueRender();
+      }
+    }
+
+    function applyTableFilter(cellIndex, outputIndex, columnIndex) {
+      if (!Number.isInteger(cellIndex) || !Number.isInteger(outputIndex) || !Number.isInteger(columnIndex)) {
+        return;
+      }
+
+      const input = document.querySelector('input[data-table-filter-input="true"][data-cell-index="' + cellIndex + '"][data-output-index="' + outputIndex + '"][data-column-index="' + columnIndex + '"]');
+      const tableState = ensureTableViewState(cellIndex, outputIndex);
+      tableState.filters[columnIndex] = String(input?.value || '').trim();
+      queueRender();
+    }
+
+    function clearTableFilter(cellIndex, outputIndex, columnIndex) {
+      if (!Number.isInteger(cellIndex) || !Number.isInteger(outputIndex) || !Number.isInteger(columnIndex)) {
+        return;
+      }
+
+      const tableState = ensureTableViewState(cellIndex, outputIndex);
+      tableState.filters[columnIndex] = '';
+      queueRender();
+    }
+
+    function clearTableColor(cellIndex, outputIndex, columnIndex) {
+      if (!Number.isInteger(cellIndex) || !Number.isInteger(outputIndex) || !Number.isInteger(columnIndex)) {
+        return;
+      }
+
+      const tableState = ensureTableViewState(cellIndex, outputIndex);
+      tableState.columnColors[columnIndex] = '';
+      queueRender();
+    }
+
+    function normalizeColorPickerValue(value) {
+      return /^#[0-9a-fA-F]{6}$/.test(String(value || '')) ? String(value) : '#ffffff';
+    }
+
+    function exportTableAsCsv(cellIndex, outputIndex) {
+      const payload = getInteractiveTablePayload(cellIndex, outputIndex);
+      if (!payload) {
+        return;
+      }
+
+      const tableData = getRenderedTableData(cellIndex, outputIndex, payload);
+      vscode.postMessage({
+        type: 'exportCsv',
+        columns: tableData.columns,
+        rows: tableData.rows,
+      });
+    }
+
+    function getRenderedTableData(cellIndex, outputIndex, payload) {
+      const state = ensureTableViewState(cellIndex, outputIndex);
+      let rows = payload.rows.slice();
+      state.filters.forEach((filterValue, columnIndex) => {
+        if (!filterValue) {
+          return;
+        }
+        const needle = filterValue.toLowerCase();
+        rows = rows.filter((row) => String(row[columnIndex] === undefined || row[columnIndex] === null ? '' : row[columnIndex]).toLowerCase().includes(needle));
+      });
+
+      if (state.sortColumn !== null) {
+        rows = rows.slice().sort((left, right) => compareTableValues(left[state.sortColumn], right[state.sortColumn], state.sortDirection));
+      }
+
+      return {
+        columns: payload.columns,
+        rows,
+      };
+    }
+
+    function compareTableValues(left, right, direction) {
+      const multiplier = direction === 'desc' ? -1 : 1;
+      const leftNumber = Number(left);
+      const rightNumber = Number(right);
+      if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+        return (leftNumber - rightNumber) * multiplier;
+      }
+
+      return String(left === undefined || left === null ? '' : left).localeCompare(String(right === undefined || right === null ? '' : right), undefined, { numeric: true, sensitivity: 'base' }) * multiplier;
+    }
+
+    function getInteractiveTablePayload(cellIndex, outputIndex) {
+      const result = runResults.get(cellIndex);
+      const output = result?.outputs?.[outputIndex];
+      if (!output || output.mime !== 'application/x-databricks-table+json') {
+        return undefined;
+      }
+      return parseInteractiveTablePayload(output.value);
+    }
+
+    function parseInteractiveTablePayload(rawValue) {
+      try {
+        const payload = JSON.parse(String(rawValue || '{}'));
+        if (!Array.isArray(payload.columns) || !Array.isArray(payload.rows)) {
+          return undefined;
+        }
+        return payload;
+      } catch {
+        return undefined;
+      }
+    }
+
+    function ensureTableViewState(cellIndex, outputIndex) {
+      const key = getTableStateKey(cellIndex, outputIndex);
+      const existing = tableViewState.get(key);
+      if (existing) {
+        return existing;
+      }
+
+      const next = {
+        sortColumn: null,
+        sortDirection: 'asc',
+        filters: [],
+        columnColors: {},
+      };
+      tableViewState.set(key, next);
+      return next;
+    }
+
+    function resetTableState(cellIndex) {
+      Array.from(tableViewState.keys()).forEach((key) => {
+        if (key.startsWith(cellIndex + ':')) {
+          tableViewState.delete(key);
+        }
+      });
+      if (openTableMenu && openTableMenu.cellIndex === cellIndex) {
+        openTableMenu = null;
+      }
+    }
+
+    function getTableStateKey(cellIndex, outputIndex) {
+      return cellIndex + ':' + outputIndex;
     }
 
     function escapeHtml(value) {
@@ -1763,6 +2387,22 @@ class DatabricksSourceEditorProvider {
     function renderCodePreview(value, type) {
       const text = String(value || '');
       return fallbackRenderCodePreview(text, type);
+    }
+
+    function renderMarkdownPreview(value) {
+      if (!markdownRenderer && typeof window.markdownit === 'function') {
+        markdownRenderer = window.markdownit({
+          html: false,
+          linkify: true,
+          typographer: true,
+        });
+      }
+
+      if (!markdownRenderer) {
+        return '<pre>' + escapeHtml(String(value || '')) + '</pre>';
+      }
+
+      return markdownRenderer.render(String(value || ''));
     }
 
     function syncCellPreview(index) {
@@ -2643,6 +3283,12 @@ async function executeDatabricksCellRuntime(cli, sessions, extensionContext, cel
   const contextId = await sessions.ensureLanguageContext(sessionTarget, spec.dbLanguage);
   const commandText = prepareExecutableCode(getCellText(cellLike), spec.magic);
   const response = await cli.executeAndWait(session.profile, session.clusterId, contextId, spec.dbLanguage, commandText);
+  logVerbose('Databricks command finished.', {
+    language: spec.dbLanguage,
+    profile: session.profile,
+    clusterId: session.clusterId,
+    response,
+  });
   return {
     ok: response.status !== 'Error',
     ...buildOutputsFromResponse(response),
@@ -2756,16 +3402,20 @@ function buildDatabricksSourceEditorUiState(context) {
     clusterActionDisabled = true;
   } else if (selectedProfile?.name && selectedCluster?.id) {
     const snapshot = getClusterStatusSnapshot(selectedProfile.name, selectedCluster.id);
+    const isTimerResetPending = clusterTimerResetPendingKeys.has(getClusterKey(selectedProfile.name, selectedCluster.id));
     clusterState = snapshot?.clusterState || 'selected';
     clusterLabel = snapshot ? formatClusterDisplayLabel(snapshot) : (selectedCluster.name || selectedCluster.id);
     const clusterName = snapshot?.clusterName || selectedCluster.name || selectedCluster.id;
     if (clusterState === 'running') {
       const timerLabel = formatClusterTimerLabel(snapshot);
-      clusterActionState = timerLabel === '-:--' ? 'runningUnknownTimer' : 'running';
-      clusterActionLabel = timerLabel === '-:--'
+      clusterActionState = isTimerResetPending ? 'starting' : (timerLabel === '-:--' ? 'runningUnknownTimer' : 'running');
+      clusterActionLabel = isTimerResetPending
+        ? `🟡 Syncing ${clusterName} (-:--)`
+        : timerLabel === '-:--'
         ? `🟢 Reset timer ${clusterName} (-:--)`
         : `🟢 Stop ${clusterName} (${timerLabel})`;
-      canRun = true;
+      clusterActionDisabled = isTimerResetPending;
+      canRun = !isTimerResetPending;
     } else if (clusterState === 'starting') {
       clusterActionState = 'starting';
       clusterActionLabel = `🟡 Starting ${clusterName}`;
@@ -3113,7 +3763,7 @@ function serializeSourceNotebook(data) {
     lines.push('');
   }
 
-  return lines.join('\n');
+  return `${lines.join('\n')}\n`;
 }
 
 function serializeCell(cell) {
@@ -3258,7 +3908,7 @@ function prepareExecutableCode(text, magic) {
   const firstLine = lines[0] || '';
   const rawMagic = firstLine.match(/^\s*%([^\s]+)(?:\s+(.*))?\s*$/);
   if (!rawMagic || normalizeMagic(rawMagic[1]) !== normalizedMagic) {
-    return text;
+    return normalizedMagic === 'python' ? wrapPythonDisplayCode(text) : text;
   }
 
   const rest = [];
@@ -3266,7 +3916,11 @@ function prepareExecutableCode(text, magic) {
     rest.push(rawMagic[2]);
   }
   rest.push(...lines.slice(1));
-  return rest.join('\n');
+  return normalizedMagic === 'python' ? wrapPythonDisplayCode(rest.join('\n')) : rest.join('\n');
+}
+
+function wrapPythonDisplayCode(text) {
+  return `${PYTHON_DISPLAY_SHIM}\n${text}`;
 }
 
 function buildOutputsFromResponse(response) {
@@ -3293,6 +3947,12 @@ function buildOutputsFromResponse(response) {
 
   const items = [];
   if (resultType === 'table') {
+    const webviewTable = buildWebviewTablePayload(results);
+    const htmlTable = tryBuildHtmlTable(results);
+    if (htmlTable) {
+      items.push(vscode.NotebookCellOutputItem.text(htmlTable, 'text/html'));
+    }
+
     const markdownTable = tryBuildMarkdownTable(results);
     if (markdownTable) {
       items.push(vscode.NotebookCellOutputItem.text(markdownTable, 'text/markdown'));
@@ -3312,6 +3972,13 @@ function buildOutputsFromResponse(response) {
         'text/x-json'
       )
     );
+
+    return {
+      outputs: [new vscode.NotebookCellOutput(items)],
+      webviewOutputs: webviewTable
+        ? [{ mime: 'application/x-databricks-table+json', value: JSON.stringify(webviewTable) }]
+        : mapOutputItemsToWebview(items),
+    };
   } else if (resultType === 'image') {
     const fileName = readResultField(results, 'fileName', 'file_name');
     if (typeof fileName === 'string' && fileName.startsWith('data:image/')) {
@@ -3334,8 +4001,33 @@ function buildOutputsFromResponse(response) {
     if (!html || images.some((value) => typeof value !== 'string' || !value.startsWith('data:image/'))) {
       items.push(vscode.NotebookCellOutputItem.text(JSON.stringify(images, null, 2), 'text/x-json'));
     }
-  } else if (typeof readResultField(results, 'data') === 'string') {
-    items.push(vscode.NotebookCellOutputItem.text(readResultField(results, 'data')));
+  } else if (readTextResult(results) !== undefined) {
+    const textResult = readTextResult(results);
+    const inlineTable = extractInlineTableResult(textResult);
+    if (inlineTable) {
+      const htmlTable = tryBuildHtmlTable(inlineTable);
+      if (htmlTable) {
+        items.push(vscode.NotebookCellOutputItem.text(htmlTable, 'text/html'));
+      }
+
+      const markdownTable = tryBuildMarkdownTable(inlineTable);
+      if (markdownTable) {
+        items.push(vscode.NotebookCellOutputItem.text(markdownTable, 'text/markdown'));
+      }
+
+      items.push(vscode.NotebookCellOutputItem.text(JSON.stringify({
+        columns: inlineTable.schema.map((column) => column.name),
+        data: inlineTable.data,
+        truncated: inlineTable.truncated,
+      }, null, 2), 'text/x-json'));
+
+      return {
+        outputs: [new vscode.NotebookCellOutput(items)],
+        webviewOutputs: [{ mime: 'application/x-databricks-table+json', value: JSON.stringify(buildWebviewTablePayload(inlineTable)) }],
+      };
+    }
+
+    items.push(vscode.NotebookCellOutputItem.text(textResult));
   } else if (readResultField(results, 'data') !== undefined) {
     items.push(vscode.NotebookCellOutputItem.text(JSON.stringify(readResultField(results, 'data'), null, 2), 'text/x-json'));
   }
@@ -3380,6 +4072,77 @@ function mapOutputItemsToWebview(items) {
 }
 
 function tryBuildMarkdownTable(results) {
+  const table = readResultTable(results);
+  if (!table) {
+    return undefined;
+  }
+
+  const { columns, rows } = table;
+  const header = `| ${columns.join(' | ')} |`;
+  const divider = `| ${columns.map(() => '---').join(' | ')} |`;
+  const body = rows.map((row) => `| ${row.map(formatMarkdownCellValue).join(' | ')} |`);
+  return [header, divider, ...body].join('\n');
+}
+
+function tryBuildHtmlTable(results) {
+  const table = readResultTable(results);
+  if (!table) {
+    return undefined;
+  }
+
+  const { columns, rows } = table;
+  const header = columns
+    .map((column) => `<th style="border:1px solid #444;padding:6px 8px;text-align:left;background:#1f1f1f;color:#f0f0f0;">${escapeHtml(column)}</th>`)
+    .join('');
+  const body = rows
+    .map((row) => `<tr>${row.map((value) => `<td style="border:1px solid #444;padding:6px 8px;text-align:left;white-space:pre-wrap;vertical-align:top;">${escapeHtml(value === null || value === undefined ? '' : String(value))}</td>`).join('')}</tr>`)
+    .join('');
+
+  return `<table style="border-collapse:collapse;width:100%;font-family:var(--vscode-editor-font-family, sans-serif);font-size:12px;"><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function buildWebviewTablePayload(results) {
+  const table = readResultTable(results);
+  if (!table) {
+    return undefined;
+  }
+
+  return {
+    columns: table.columns,
+    rows: table.rows,
+    truncated: readResultField(results, 'truncated') === true,
+  };
+}
+
+function extractInlineTableResult(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const markerLine = lines.find((line) => line.startsWith(INLINE_TABLE_MARKER));
+  if (!markerLine) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(markerLine.slice(INLINE_TABLE_MARKER.length));
+    if (!Array.isArray(parsed.columns) || !Array.isArray(parsed.rows)) {
+      return undefined;
+    }
+
+    return {
+      schema: parsed.columns.map((name) => ({ name })),
+      data: parsed.rows,
+      truncated: parsed.truncated === true,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function readTextResult(results) {
+  const value = readResultField(results, 'data', 'summary', 'result');
+  return typeof value === 'string' ? value : undefined;
+}
+
+function readResultTable(results) {
   const schema = Array.isArray(readResultField(results, 'schema')) ? readResultField(results, 'schema') : [];
   const columns = schema.map((column, index) => column.name || column.column_name || `col_${index + 1}`);
   if (!columns.length) {
@@ -3396,10 +4159,7 @@ function tryBuildMarkdownTable(results) {
     return undefined;
   }
 
-  const header = `| ${columns.join(' | ')} |`;
-  const divider = `| ${columns.map(() => '---').join(' | ')} |`;
-  const body = rows.map((row) => `| ${row.map(formatMarkdownCellValue).join(' | ')} |`);
-  return [header, divider, ...body].join('\n');
+  return { columns, rows };
 }
 
 function formatMarkdownCellValue(value) {
@@ -3408,6 +4168,27 @@ function formatMarkdownCellValue(value) {
   }
 
   return String(value).replace(/\|/g, '\\|');
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function buildCsvFromTable(columns, rows) {
+  const csvRows = [columns, ...rows];
+  return `${csvRows.map((row) => row.map(formatCsvCell).join(',')).join('\n')}\n`;
+}
+
+function formatCsvCell(value) {
+  const text = value === null || value === undefined ? '' : String(value);
+  if (!/[",\n\r]/.test(text)) {
+    return text;
+  }
+
+  return `"${text.replace(/"/g, '""')}"`;
 }
 
 function escapeHtmlAttribute(value) {
@@ -4348,6 +5129,9 @@ async function resetSelectedRunningClusterTimer(context, cli, reason) {
     return existing;
   }
 
+  clusterTimerResetPendingKeys.add(key);
+  void refreshDatabricksUi();
+
   const resetPromise = (async () => {
     try {
       logVerbose('Checking selected cluster before timer reset.', { profile, clusterId, reason });
@@ -4386,7 +5170,9 @@ async function resetSelectedRunningClusterTimer(context, cli, reason) {
       await refreshDatabricksUi();
       return undefined;
     } finally {
+      clusterTimerResetPendingKeys.delete(key);
       clusterTimerResetPromises.delete(key);
+      await refreshDatabricksUi();
     }
   })();
 
@@ -4671,4 +5457,13 @@ function normalizeError(error) {
 module.exports = {
   activate,
   deactivate,
+  __test: {
+    buildCsvFromTable,
+    buildOutputsFromResponse,
+    prepareExecutableCode,
+    parseSourceNotebook,
+    serializeSourceNotebook,
+    tryBuildHtmlTable,
+    tryBuildMarkdownTable,
+  },
 };

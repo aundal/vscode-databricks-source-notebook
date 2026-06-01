@@ -2,7 +2,7 @@
   "name": "databricks-source-notebook-prototype",
   "displayName": "Databricks Source Notebook Prototype",
   "description": "Prototype notebook UX for Databricks source-format Python notebooks in VS Code.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "standup-steve",
   "repository": {
     "type": "git",
@@ -12,7 +12,11 @@
     "vscode": "^1.90.0"
   },
   "main": "./extension.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
+    "markdown-it": "^14.1.0",
     "monaco-editor": "^0.55.1"
   },
   "categories": [
@@ -278,8 +282,5 @@
         }
       }
     }
-  },
-  "dependencies": {
-    "monaco-editor": "^0.55.1"
   }
 }
