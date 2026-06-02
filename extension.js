@@ -184,6 +184,12 @@ function activate(context) {
         void refreshDatabricksUi();
       }
     }),
+    vscode.workspace.onDidOpenTextDocument((document) => {
+      void maybeOpenDatabricksSourceEditor(document);
+    }),
+    vscode.window.onDidChangeVisibleTextEditors((editors) => {
+      void migrateVisibleTextEditorsToCustomEditor(editors);
+    }),
     vscode.window.onDidChangeVisibleNotebookEditors((editors) => {
       void migrateVisibleNotebookEditorsToCustomEditor(editors);
     }),
@@ -282,6 +288,7 @@ function activate(context) {
   );
 
   void refreshDatabricksUi();
+  void migrateVisibleTextEditorsToCustomEditor(vscode.window.visibleTextEditors);
   void migrateVisibleNotebookEditorsToCustomEditor(vscode.window.visibleNotebookEditors);
 }
 
@@ -375,6 +382,52 @@ async function migrateVisibleNotebookEditorsToCustomEditor(editors) {
   }
 }
 
+async function migrateVisibleTextEditorsToCustomEditor(editors) {
+  for (const editor of editors) {
+    await maybeOpenDatabricksSourceEditor(editor?.document, { preserveFocus: true });
+  }
+}
+
+async function maybeOpenDatabricksSourceEditor(document, options = {}) {
+  if (!isDatabricksSourceTextDocument(document)) {
+    return;
+  }
+
+  const resource = document.uri;
+  const alreadyCustom = vscode.window.tabGroups.all.some((group) =>
+    group.tabs.some((tab) => tab.input?.uri?.toString?.() === resource.toString() && tab.input?.viewType === CUSTOM_EDITOR_TYPE)
+  );
+  if (alreadyCustom) {
+    return;
+  }
+
+  const targetTab = findTextTab(resource);
+  try {
+    await vscode.commands.executeCommand('vscode.openWith', resource, CUSTOM_EDITOR_TYPE, {
+      preview: false,
+      preserveFocus: options.preserveFocus === true,
+    });
+    if (targetTab) {
+      await vscode.window.tabGroups.close(targetTab, true);
+    }
+  } catch {
+    // Leave the default text editor open if migration fails.
+  }
+}
+
+function isDatabricksSourceTextDocument(document) {
+  if (!document || document.uri.scheme !== 'file') {
+    return false;
+  }
+
+  if (document.languageId !== 'python' && document.uri.path.toLowerCase().endsWith('.py') === false) {
+    return false;
+  }
+
+  const firstLine = document.lineCount > 0 ? document.lineAt(0).text : '';
+  return firstLine === NOTEBOOK_HEADER;
+}
+
 function resolveNotebookSourceUri(notebook) {
   const sourceUri = notebook?.metadata?.databricksSourceUri;
   if (typeof sourceUri === 'string' && sourceUri) {
@@ -393,6 +446,19 @@ function findNotebookTab(resource, notebookType) {
     for (const tab of group.tabs) {
       const input = tab.input;
       if (input?.uri?.toString?.() === resource.toString() && input?.notebookType === notebookType) {
+        return tab;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function findTextTab(resource) {
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      const input = tab.input;
+      if (input?.uri?.toString?.() === resource.toString() && !input?.viewType && !input?.notebookType) {
         return tab;
       }
     }
